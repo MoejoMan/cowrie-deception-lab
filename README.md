@@ -20,7 +20,9 @@ Most guessed passwords: `123456` (1,260), `123` (587), `1234` (489). The usernam
 
 Credentials that actually worked: `root/admin` (103), `root/123456` (40), `root/changeme` (10).
 
-![Cowrie events in Kibana](docs/kibana-discover.png)
+![Source IPs plotted in Kibana](docs/attack-map.png)
+
+<sub>691 unique source IPs, 82 countries, five days.</sub>
 
 ## Diicot
 
