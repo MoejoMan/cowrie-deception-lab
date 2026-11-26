@@ -1,0 +1,40 @@
+#!/bin/bash
+# Daily disk caps for honeypot data. Oldest-first; every deletion is logged.
+# Caps are ceilings against runaway growth, not targets. Raise them freely.
+set -u
+LIB=/opt/honeypot/data/cowrie/var/lib/cowrie
+LOGDIR=/opt/honeypot/data/cowrie/var/log/cowrie
+LOG=/var/log/honeypot-housekeeping.log
+SAMPLES_CAP_MB=${SAMPLES_CAP_MB:-2048}
+TTY_CAP_MB=${TTY_CAP_MB:-1024}
+RAW_LOG_DAYS=${RAW_LOG_DAYS:-90}
+note() { echo "$(date -u '+%F %T') $*" >> "$LOG"; }
+
+cap_dir() {  # cap_dir <dir> <cap MB> <label>
+  local dir=$1 cap=$(( $2 * 1024 * 1024 )) label=$3 total f size
+  [[ -d $dir ]] || return
+  total=$(find "$dir" -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')
+  (( total <= cap )) && return
+  note "$label over cap: $((total/1048576)) MB > $(( cap/1048576 )) MB; deleting oldest"
+  while IFS= read -r f; do
+    (( total <= cap )) && break
+    size=$(stat -c %s "$f")
+    note "deleted $label: $(basename "$f") ($size bytes, sha256 $(sha256sum "$f" | cut -c1-64))"
+    rm -f -- "$f"; total=$(( total - size ))
+  done < <(find "$dir" -type f -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
+}
+
+cap_dir "$LIB/downloads" "$SAMPLES_CAP_MB" "sample"
+cap_dir "$LIB/tty" "$TTY_CAP_MB" "tty-recording"
+
+# Rotated raw logs (cowrie.json.YYYY-MM-DD) older than N days. Never the live cowrie.json.
+find "$LOGDIR" -maxdepth 1 -type f -name 'cowrie.json.*' -mtime +"$RAW_LOG_DAYS" -print0 |
+  while IFS= read -r -d '' f; do note "deleted raw log $(basename "$f") (older than ${RAW_LOG_DAYS}d)"; rm -f -- "$f"; done
+
+# Usage snapshot, read by the daily heartbeat.
+{
+  echo "samples_mb=$(( $(du -sb "$LIB/downloads" 2>/dev/null | cut -f1) / 1048576 ))"
+  echo "tty_mb=$(( $(du -sb "$LIB/tty" 2>/dev/null | cut -f1) / 1048576 ))"
+  echo "rawlogs_mb=$(( $(du -sb "$LOGDIR" 2>/dev/null | cut -f1) / 1048576 ))"
+} > /var/lib/honeypot-health/usage
+exit 0

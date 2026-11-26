@@ -1,0 +1,37 @@
+# Ships Cowrie's JSON events into Elasticsearch.
+# Enrichment (timestamp, GeoIP, ASN) happens in ES via the index's default pipeline.
+
+filebeat.inputs:
+  - type: filestream
+    id: cowrie-json
+    paths:
+      - /cowrie-logs/cowrie.json
+      - /cowrie-logs/cowrie.json.*        # Cowrie rotates daily
+
+processors:
+  # Cowrie's fields go under "cowrie.*". Filebeat injects its own fields (notably
+  # input.type) which overwrote Cowrie's "input" (the attacker's command) when they
+  # shared the top level. decode_json_fields (unlike the ndjson parser) also keeps the
+  # raw line in "message", which the ES pipeline stores as event.original.
+  - decode_json_fields:
+      fields: ["message"]
+      target: "cowrie"
+      max_depth: 3
+      add_error_key: true
+  # Filebeat metadata noise; keep log.file.path for provenance.
+  # (Top-level "message" holds the raw JSON line; the ES pipeline keeps it as event.original.)
+  - drop_fields:
+      fields: ["input", "ecs", "agent", "log.offset"]
+      ignore_missing: true
+
+output.elasticsearch:
+  hosts: ["http://es:9200"]
+  username: filebeat_cowrie              # write-only user, can't read or delete data
+  password: "${FILEBEAT_PASSWORD}"
+  index: "cowrie-%{+yyyy.MM.dd}"
+
+# Template, retention and pipeline are created by elk/setup.sh instead.
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+logging.level: info

@@ -1,0 +1,26 @@
+## Honeypot host monitoring. Search with:  sudo ausearch -k <key> -i
+##
+## Escape canary: uid 64999 only exists inside the Cowrie sandbox.
+## ANY program started by it on the real host is a sandbox escape.
+-a always,exit -F arch=b64 -S execve,execveat -F uid=64999 -k honeypot_escape
+-a always,exit -F arch=b64 -S execve,execveat -F euid=64999 -k honeypot_escape
+-a always,exit -F arch=b32 -S execve -F uid=64999 -k honeypot_escape
+
+## Privilege and account changes
+-w /etc/sudoers -p wa -k priv_change
+-w /etc/sudoers.d/ -p wa -k priv_change
+-w /etc/passwd -p wa -k account_change
+-w /etc/shadow -p wa -k account_change
+-w /etc/group -p wa -k account_change
+
+## Real SSH config (must stay WireGuard-only)
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+-w /etc/systemd/system/ssh.socket.d/ -p wa -k sshd_config
+
+## Docker control plane (socket access = root)
+-w /run/docker.sock -p rwa -k docker_sock
+-w /etc/docker/ -p wa -k docker_config
+
+## WireGuard keys/config
+-w /etc/wireguard/ -p rwa -k wireguard

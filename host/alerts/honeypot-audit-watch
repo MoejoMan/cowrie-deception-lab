@@ -1,0 +1,40 @@
+#!/bin/bash
+# Follows the audit log live and alerts on honeypot-relevant events.
+# Runs as a systemd service (honeypot-audit-watch.service), restarts if it dies.
+set -u
+declare -A last   # rate limit: one alert per title per 5 minutes
+
+tail -n0 -F /var/log/audit/audit.log 2>/dev/null | while IFS= read -r line; do
+  key=""
+  case $line in
+    # Rule (re)loads at boot mention the keys too; never alert on those.
+    type=CONFIG_CHANGE*) continue ;;
+
+    # gVisor's sandbox tried a forbidden kernel call and was killed:
+    # someone is attacking the sandbox itself.
+    type=SECCOMP*'exe="/usr/bin/runsc"'*|type=SECCOMP*'comm="gvisor_sentry"'*|type=SECCOMP*'comm="exe"'*)
+      key=seccomp_kill ;;
+
+    # uid 64999 only exists inside the honeypot. A program run by it on the host
+    # means Cowrie is running WITHOUT gVisor, or something got out.
+    *'key="honeypot_escape"'*)
+      key=escape_uid ;;
+
+    # Manual end-to-end test:  sudo auditctl -m honeypot-alert-selftest
+    *honeypot-alert-selftest*)
+      key=selftest ;;
+
+    *'key="priv_change"'*)    key=sudoers_changed ;;
+    *'key="account_change"'*) key=account_changed ;;
+    *'key="sshd_config"'*)    key=sshd_changed ;;
+    *) continue ;;
+  esac
+
+  now=$(date +%s)
+  (( now - ${last[$key]:-0} < 300 )) && continue
+  last[$key]=$now
+
+  # Whole field names only (so "uid=" doesn't also match "euid="/"auid=").
+  detail=$(printf ' %s' "$line" | grep -oE ' (type|comm|exe|uid|auid|pid|ppid|name|key|syscall)=("[^"]*"|[^ ]+)' | sed 's/^ //' | tr '\n' ' ')
+  /usr/local/sbin/honeypot-alert "$key" "$detail"
+done

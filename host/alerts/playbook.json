@@ -1,0 +1,288 @@
+{
+ "_comment": "One entry per situation the honeypot can detect. honeypot-alert looks alerts up here by key.",
+ "escape_uid": {
+  "level": "critical",
+  "title": "Possible honeypot ESCAPE: honeypot user ran a program on the real server",
+  "what": "A program was started directly on the real server by user 64999. That user only exists inside the honeypot, so this should never happen.",
+  "means": "Either an attacker broke out of the honeypot, or the honeypot is running WITHOUT its gVisor sandbox. Treat it as a real breach until proven otherwise. (If you were testing the alarm yourself in the last few minutes, that's what this is.)",
+  "actions": [
+   "Were you testing? If you just ran a test as uid 64999, you can stop here.",
+   "If not: CONTAIN NOW. Run: sudo honeypot-contain  (cuts the honeypot off and saves evidence).",
+   "Read what ran: sudo ausearch -k honeypot_escape -i --start today",
+   "Check the honeypot runtime: docker inspect -f '{{.HostConfig.Runtime}}' honeypot-cowrie-1  (must say runsc).",
+   "Do NOT reboot or delete anything yet. Memory and logs are evidence.",
+   "If anything looks unexplained: assume the server is compromised. Rebuild it, and rotate your WireGuard keys and GitHub deploy key."
+  ]
+ },
+ "seccomp_kill": {
+  "level": "critical",
+  "title": "gVisor sandbox KILLED by the kernel: possible escape attempt",
+  "what": "The kernel killed one of gVisor's processes because it tried a system call that its security filter (seccomp) forbids.",
+  "means": "gVisor is the wall between the honeypot and the real kernel. Normal operation never trips this filter, so either someone is actively attacking the sandbox itself, or gVisor hit a serious bug. The filter worked (it blocked the call), but you need to look.",
+  "actions": [
+   "CONTAIN: sudo honeypot-contain",
+   "See exactly what was blocked: sudo ausearch -m SECCOMP -i --start today",
+   "Check what the attacker was doing just before: in Kibana, filter cowrie.session for sessions active at that time.",
+   "Update gVisor before restarting the honeypot: sudo apt update && sudo apt install --only-upgrade runsc",
+   "Consider reporting it to the gVisor project (github.com/google/gvisor) if it looks like a real exploit."
+  ]
+ },
+ "selftest": {
+  "level": "critical",
+  "title": "TEST: alert pipeline self-test",
+  "what": "Someone ran the alert self-test (sudo auditctl -m honeypot-alert-selftest).",
+  "means": "Nothing is wrong. If you're reading this, critical alerts reach you end to end: audit log, watcher, Discord and ntfy.",
+  "actions": [
+   "No action needed."
+  ]
+ },
+ "sudoers_changed": {
+  "level": "warning",
+  "title": "Admin (sudo) permissions were changed",
+  "what": "A file controlling who can use sudo (/etc/sudoers or /etc/sudoers.d/) was modified.",
+  "means": "Changing sudo rules is exactly what an attacker does to keep root access. It's also what you do when you set up or remove temporary sudo rules, so check whether it was you.",
+  "actions": [
+   "Was it you (or a timer you set)? If so, nothing to do.",
+   "List the rules: sudo ls -la /etc/sudoers.d/ && sudo cat /etc/sudoers.d/*",
+   "See who changed what: sudo ausearch -k priv_change -i --start today",
+   "Any rule you don't recognise: remove it, then run sudo visudo -c to check the config is valid."
+  ]
+ },
+ "account_changed": {
+  "level": "warning",
+  "title": "User accounts or passwords were changed",
+  "what": "/etc/passwd, /etc/shadow or /etc/group was modified.",
+  "means": "Someone added or changed a user, group or password. Package installs sometimes create system users, so check what changed before worrying.",
+  "actions": [
+   "Did you install a package or change a password just now? Then it's expected.",
+   "See who changed what: sudo ausearch -k account_change -i --start today",
+   "List accounts that can log in: grep -vE 'nologin|false' /etc/passwd",
+   "List sudo group members: getent group sudo  (should be just: admin)"
+  ]
+ },
+ "sshd_changed": {
+  "level": "warning",
+  "title": "Real SSH configuration was changed",
+  "what": "The configuration of your REAL SSH server (not the honeypot) was modified.",
+  "means": "SSH must stay reachable only through WireGuard. An attacker would change this to open a back door. You'd also change it when hardening SSH yourself.",
+  "actions": [
+   "Was it you? If so, nothing to do.",
+   "See who changed what: sudo ausearch -k sshd_config -i --start today",
+   "Check where SSH listens: ss -tln '( sport = :22 )'  (must show only 10.99.0.1:22).",
+   "Check the effective settings: sudo sshd -T | grep -E 'allowusers|passwordauthentication|permitrootlogin'"
+  ]
+ },
+ "cowrie_down": {
+  "level": "warning",
+  "title": "Honeypot is not running",
+  "what": "The Cowrie honeypot container is stopped.",
+  "means": "You're not collecting attack data. Not dangerous on its own, but it could also mean the honeypot crashed, ran out of memory, or someone stopped it.",
+  "actions": [
+   "Did you stop it on purpose? Create ~/honeypot/MAINTENANCE to silence these while you work.",
+   "Why did it stop: docker logs --tail 50 honeypot-cowrie-1",
+   "Out of memory? docker inspect -f '{{.State.OOMKilled}}' honeypot-cowrie-1",
+   "Start it safely: cd ~/honeypot && ./up.sh  (refuses if a security layer is missing)."
+  ]
+ },
+ "cowrie_no_gvisor": {
+  "level": "warning",
+  "title": "Honeypot is running WITHOUT its gVisor sandbox",
+  "what": "The honeypot container is running, but not under gVisor (runsc).",
+  "means": "One of the main walls between attackers and your real server is missing. The honeypot is far less isolated than designed. Fix this immediately.",
+  "actions": [
+   "Stop it now: cd ~/honeypot && docker compose stop cowrie",
+   "Check gVisor is still registered: docker info | grep -i runsc",
+   "Check the compose file still says runtime: runsc: grep runtime ~/honeypot/docker-compose.yml",
+   "Restart safely: cd ~/honeypot && ./up.sh"
+  ]
+ },
+ "filebeat_down": {
+  "level": "warning",
+  "title": "Log shipper (Filebeat) is not running",
+  "what": "Filebeat, which copies honeypot logs into Elasticsearch, is stopped.",
+  "means": "Attacks are still recorded on disk, but won't appear in Kibana until Filebeat runs again. Nothing is lost: it catches up from where it left off.",
+  "actions": [
+   "Why did it stop: docker logs --tail 50 honeypot-filebeat-1",
+   "Start it: cd ~/honeypot && docker compose up -d filebeat"
+  ]
+ },
+ "es_down": {
+  "level": "warning",
+  "title": "Elasticsearch is not running",
+  "what": "The Elasticsearch database container is stopped.",
+  "means": "Kibana and the daily report won't work. Attacks are still saved to disk by Cowrie and will be shipped once Elasticsearch is back. Most common cause on this server: running out of memory.",
+  "actions": [
+   "Out of memory? docker inspect -f '{{.State.OOMKilled}}' honeypot-es-1",
+   "Why did it stop: docker logs --tail 50 honeypot-es-1",
+   "Start it: cd ~/honeypot && docker compose up -d es",
+   "If memory is the problem: docker compose stop kibana  (frees ~1 GB; start it only when you need it)."
+  ]
+ },
+ "es_unhealthy": {
+  "level": "warning",
+  "title": "Elasticsearch is unhealthy",
+  "what": "Elasticsearch is running but not answering properly, or its health is red.",
+  "means": "New events may not be stored. Common causes: still starting up (wait 2 minutes), disk nearly full, or memory pressure.",
+  "actions": [
+   "Wait 2 minutes: it may just be starting.",
+   "Disk space: df -h /  (Elasticsearch stops writing above ~90%).",
+   "Status: cd ~/honeypot && set -a && . ./.env && curl -s -u elastic:$ELASTIC_PASSWORD localhost:9200/_cluster/health?pretty",
+   "Restart: cd ~/honeypot && docker compose restart es"
+  ]
+ },
+ "firewall_service": {
+  "level": "warning",
+  "title": "Honeypot outbound-block service is not active",
+  "what": "cowrie-firewall.service (which installs the rules stopping the honeypot from connecting out) isn't active.",
+  "means": "The rules may still be in place (see the separate 'rules missing' check), but they won't be restored on the next reboot. If the rules are ALSO missing, the honeypot can reach the internet and your other services.",
+  "actions": [
+   "Why: systemctl status cowrie-firewall --no-pager",
+   "Re-apply: sudo systemctl restart cowrie-firewall",
+   "Verify: cd ~/honeypot && ./verify.sh"
+  ]
+ },
+ "egress_rules_missing": {
+  "level": "warning",
+  "title": "Honeypot outbound-block RULES ARE MISSING",
+  "what": "The firewall rules that stop the honeypot connecting out are not in place.",
+  "means": "The honeypot may now be able to reach the internet (attackers could use your server to attack others) and your own services (DNS, SSH, Elasticsearch). Something removed the rules: a firewall reload, a Docker change, or a person.",
+  "actions": [
+   "Restore them NOW: sudo /usr/local/sbin/cowrie-firewall",
+   "Confirm they're back: sudo iptables -S COWRIE-EGRESS",
+   "If they keep disappearing: stop the honeypot (cd ~/honeypot && docker compose stop cowrie) until you know why.",
+   "Run cd ~/honeypot && ./verify.sh to re-test every layer."
+  ]
+ },
+ "connlimit_missing": {
+  "level": "warning",
+  "title": "Per-attacker connection limit is MISSING",
+  "what": "The firewall rule limiting each attacker IP to 10 simultaneous connections is not in place.",
+  "means": "Not a breach. But one aggressive bot can now open hundreds of connections, exhaust the honeypot's 256 MB / 128-process limits and lock every other attacker out, so you lose data. Something removed the rules (firewall reload, Docker change, or a person).",
+  "actions": [
+   "Restore all honeypot firewall rules: sudo /usr/local/sbin/cowrie-firewall",
+   "Confirm: sudo iptables -S COWRIE-INBOUND",
+   "If it keeps disappearing, check: sudo journalctl -u cowrie-firewall --no-pager -n 20"
+  ]
+ },
+ "ssh_exposed": {
+  "level": "warning",
+  "title": "Real SSH is reachable outside WireGuard",
+  "what": "Your REAL SSH server is listening on an address other than the VPN address 10.99.0.1.",
+  "means": "The real login may now be exposed to the internet, sitting right next to a honeypot that's inviting attackers in. It also conflicts with the honeypot taking port 22.",
+  "actions": [
+   "See where it listens: ss -tln '( sport = :22 )'",
+   "Check the override is still there: cat /etc/systemd/system/ssh.socket.d/10-wireguard-only.conf",
+   "Re-apply: sudo systemctl daemon-reload && sudo systemctl restart ssh.socket ssh.service",
+   "Check who changed it: sudo ausearch -k sshd_config -i --start today"
+  ]
+ },
+ "wg_down": {
+  "level": "warning",
+  "title": "WireGuard VPN is down",
+  "what": "The WireGuard interface (wg0) isn't running.",
+  "means": "Your real SSH and Kibana are ONLY reachable through WireGuard, so you may be locked out. (If you're reading this, alerts still work, so the server itself is up.)",
+  "actions": [
+   "If you can still get in: sudo systemctl restart wg-quick@wg0",
+   "If you're locked out: provider web console (Server -> Console), log in with your password, then: sudo systemctl restart wg-quick@wg0",
+   "Why it failed: sudo journalctl -u wg-quick@wg0 --no-pager -n 30"
+  ]
+ },
+ "auditd_down": {
+  "level": "warning",
+  "title": "Escape alarm (auditd) is not running",
+  "what": "auditd, the Linux audit system that powers the escape alarm, is stopped.",
+  "means": "If an attacker escaped right now, you would NOT be told. Attackers often stop auditing first, so treat an unexplained stop as suspicious.",
+  "actions": [
+   "Start it: sudo systemctl start auditd",
+   "Check the rules are loaded: sudo auditctl -l | grep -c honeypot_escape  (should be 3)",
+   "Why it stopped: sudo journalctl -u auditd --no-pager -n 30"
+  ]
+ },
+ "audit_watch_down": {
+  "level": "warning",
+  "title": "Escape-alert watcher is not running",
+  "what": "honeypot-audit-watch, which turns audit events into alerts, isn't running.",
+  "means": "The escape alarm still RECORDS events, but nobody will be TOLD about them until this is fixed.",
+  "actions": [
+   "Start it: sudo systemctl restart honeypot-audit-watch",
+   "Why it stopped: sudo journalctl -u honeypot-audit-watch --no-pager -n 30",
+   "Test it end to end: sudo auditctl -m honeypot-alert-selftest"
+  ]
+ },
+ "cowrie_watch_down": {
+  "level": "warning",
+  "title": "File-activity watcher is not running",
+  "what": "honeypot-cowrie-watch, which alerts on attacker uploads and downloads, isn't running.",
+  "means": "Malware uploads are still saved, but you won't be notified about them.",
+  "actions": [
+   "Start it: sudo systemctl restart honeypot-cowrie-watch",
+   "Why it stopped: sudo journalctl -u honeypot-cowrie-watch --no-pager -n 30"
+  ]
+ },
+ "disk_full": {
+  "level": "warning",
+  "title": "Disk is over 85% full",
+  "what": "The server's main disk is more than 85% used.",
+  "means": "Above about 90%, Elasticsearch stops accepting new data, and a full disk can crash everything. Usual suspects: old Elasticsearch data, Docker images, uploaded malware samples.",
+  "actions": [
+   "What's big: sudo du -xh / --max-depth=2 2>/dev/null | sort -h | tail -15",
+   "Docker usage: docker system df",
+   "Malware samples: sudo du -sh ~/honeypot/data/cowrie/var/lib/cowrie/downloads",
+   "Old data is deleted automatically after 60 days. To keep less, lower min_age in ~/honeypot/elk/setup.sh and re-run it."
+  ]
+ },
+ "low_memory": {
+  "level": "warning",
+  "title": "Server is low on memory",
+  "what": "Less than 150 MB of memory is available.",
+  "means": "Linux will start killing processes soon, most likely Elasticsearch or Kibana. Usually caused by Kibana plus Elasticsearch under heavy use.",
+  "actions": [
+   "Quick fix: cd ~/honeypot && docker compose stop kibana  (frees ~1 GB; data keeps flowing).",
+   "What's using it: docker stats --no-stream",
+   "Check for anything unexpected: ps aux --sort=-%mem | head"
+  ]
+ },
+ "file_upload": {
+  "level": "info",
+  "title": "Attacker UPLOADED a file to the honeypot",
+  "what": "An attacker copied a file onto the honeypot (via SCP or SFTP). Cowrie caught it and saved a copy.",
+  "means": "This is usually malware: a bot, a cryptominer or a backdoor. It's a great find for analysis. It was never run: the honeypot only pretends to execute things.",
+  "actions": [
+   "Look it up by its sha256 hash on virustotal.com (search box). Never upload or open the file itself.",
+   "Saved at: ~/honeypot/data/cowrie/var/lib/cowrie/downloads/<sha256>  (root-only).",
+   "See the whole session in Kibana: filter cowrie.session = the session ID below.",
+   "Never run, open or unzip it on your own computer."
+  ]
+ },
+ "file_download": {
+  "level": "info",
+  "title": "Attacker tried to DOWNLOAD a file",
+  "what": "An attacker tried to fetch a file from the internet (wget, curl, tftp...). Your outbound block stopped it.",
+  "means": "The URL is where the attacker hosts their malware. That's useful threat intelligence. Nothing was downloaded.",
+  "actions": [
+   "Check the URL on virustotal.com or urlhaus.abuse.ch. Never visit it in a browser.",
+   "The URL below is 'defanged' (hxxp, [.]) so it can't be clicked by accident.",
+   "See what else the attacker did in Kibana: filter cowrie.session = the session ID below."
+  ]
+ },
+ "heartbeat": {
+  "level": "info",
+  "title": "Daily heartbeat",
+  "what": "Your honeypot's daily report for the last 24 hours.",
+  "means": "If this message ever STOPS arriving, the alerting itself is broken. Silence is not 'all good'.",
+  "actions": [
+   "No action needed. Explore the data: http://10.99.0.1:5601 (VPN on)."
+  ]
+ },
+ "file_written": {
+  "level": "info",
+  "title": "Attacker WROTE a file",
+  "what": "An attacker created or changed a file on the fake server, usually with a redirect like `echo ... > /tmp/file`. Cowrie saves a copy of what was written.",
+  "means": "Bots use this to drop small scripts, record the password that worked, or add SSH keys. It is not a download: nothing came from the internet. The 'command' line shows exactly what was typed.",
+  "actions": [
+   "Read the command line below: it tells you what the file is for.",
+   "The written content is saved under the outfile path (inside the honeypot data folder). It is attacker text: look at it, never run it.",
+   "See the whole session in Kibana: filter cowrie.session = the session ID below."
+  ]
+ }
+}

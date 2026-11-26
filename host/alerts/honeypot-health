@@ -1,0 +1,44 @@
+#!/bin/bash
+# Health check, run every 2 minutes by honeypot-health.timer.
+# Alerts once when a check starts failing, and once when it recovers.
+# Create ~/honeypot/MAINTENANCE to silence alerts while working on things.
+set -u
+HP=/opt/honeypot
+STATE_DIR=/var/lib/honeypot-health
+STATE=$STATE_DIR/failing
+mkdir -p "$STATE_DIR"; touch "$STATE"
+
+ELASTIC_PASSWORD=$(grep -m1 '^ELASTIC_PASSWORD=' "$HP/.env" | cut -d= -f2-)
+
+fails=()
+check() { local name=$1; shift; "$@" >/dev/null 2>&1 || fails+=("$name"); }
+running() { [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
+
+check cowrie_down           running honeypot-cowrie-1
+check cowrie_no_gvisor      bash -c '[[ $(docker inspect -f "{{.HostConfig.Runtime}}" honeypot-cowrie-1) == runsc ]]'
+check filebeat_down         running honeypot-filebeat-1
+check es_down               running honeypot-es-1
+check es_unhealthy          bash -c "curl -fs --max-time 10 -u 'elastic:$ELASTIC_PASSWORD' http://127.0.0.1:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"
+check firewall_service      systemctl is-active --quiet cowrie-firewall.service
+check egress_rules_missing  bash -c 'iptables -C DOCKER-USER -i br-cowrie -j COWRIE-EGRESS && iptables -C INPUT -i br-cowrie -j COWRIE-EGRESS && iptables -S COWRIE-EGRESS | grep -q -- "-j DROP"'
+check connlimit_missing     bash -c 'iptables -C DOCKER-USER -o br-cowrie -j COWRIE-INBOUND && iptables -S COWRIE-INBOUND | grep -q connlimit'
+# Only the REAL sshd counts: dockerd legitimately holds 203.0.113.10:22 for the honeypot.
+check ssh_exposed           bash -c '! ss -Htlnp "( sport = :22 )" | grep -E "\"(sshd|systemd)\"" | awk "{print \$4}" | grep -vqx "10.99.0.1:22"'
+check wg_down               systemctl is-active --quiet wg-quick@wg0
+check auditd_down           systemctl is-active --quiet auditd
+check audit_watch_down      systemctl is-active --quiet honeypot-audit-watch.service
+check cowrie_watch_down     systemctl is-active --quiet honeypot-cowrie-watch.service
+check disk_full             bash -c '(( $(df --output=pcent / | tail -1 | tr -dc 0-9) < 85 ))'
+check low_memory            awk '/MemAvailable/ {exit !($2 > 153600)}' /proc/meminfo
+
+now=$(printf '%s\n' "${fails[@]}" | sed '/^$/d' | sort)
+before=$(sort "$STATE")
+new=$(comm -13 <(echo "$before") <(echo "$now") | sed '/^$/d')
+fixed=$(comm -23 <(echo "$before") <(echo "$now") | sed '/^$/d')
+echo "$now" > "$STATE"
+
+[[ -e $HP/MAINTENANCE ]] && exit 0
+# State holds playbook keys (see playbook.json); the alert explains each one.
+[[ -n $new ]]   && /usr/local/sbin/honeypot-alert --failing   "$(paste -sd, <<<"$new")"
+[[ -n $fixed ]] && /usr/local/sbin/honeypot-alert --recovered "$(paste -sd, <<<"$fixed")"
+exit 0

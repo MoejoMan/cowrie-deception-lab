@@ -1,0 +1,52 @@
+# Cowrie overrides. Layered on top of the image's bundled cowrie.cfg.dist
+# (Cowrie 3.1.7); only keys set here change. Mounted read-only.
+
+[honeypot]
+# Disguise: The persona's forgotten staging server (see disguise/build_persona.py).
+hostname = web-staging
+# What `ifconfig` etc. show as this machine's IP (instead of the Docker address).
+internet_facing_ip = 203.0.113.10
+# Canned outputs for commands Cowrie doesn't emulate (ss, mysql...), checked
+# before the bundled ones. Consistent with the the persona story.
+txtcmds_path = /cowrie/cowrie-git/etc/txtcmds
+# SECURITY: emulated shell only. Never set this to "pool" (real VMs) or
+# enable [proxy] / [llm]; those give attackers real execution or outbound access.
+backend = shell
+# Realistic logins: only plausible passwords, one working login per attacker IP.
+# Defined in cowrie/patches/auth.py, passwords in etc/persona-passwords.txt.
+# (userdb.txt is no longer used.)
+auth_class = PersonaAuth
+timezone = UTC
+# Fixed boot time (2025-11-02 04:12 UTC), read by patches/protocol.py
+persona_boot_epoch = 0   # set to your persona's fixed boot time (unix epoch)
+idle_timeout = 180
+authentication_timeout = 120
+# Cap size of files attackers upload via scp/sftp. 100 MB: the first real botnet
+# payload (2026-11-20) was 83 MB. Disk is protected by housekeeping's 2 GB samples cap.
+download_limit_size = 104857600
+
+[shell]
+# `ssh -V`: the client that shipped with the server (Debian 12, June 2024)
+ssh_version = OpenSSH_9.2p1 Debian-2+deb12u2, OpenSSL 3.0.11 19 Sep 2023
+# the persona fake filesystem + process list, built by disguise/build.sh
+filesystem = /cowrie/cowrie-git/etc/persona-fs.pickle
+processes = /cowrie/cowrie-git/etc/persona-ps.json
+
+[ssh]
+listen_endpoints = tcp:2222:interface=0.0.0.0
+# SECURITY: no SSH port-forwarding / tunnelling through the honeypot.
+forwarding = false
+forward_redirect = false
+forward_tunnel = false
+# Keep SFTP so attacker uploads (malware samples) are captured into var/lib/cowrie/downloads.
+sftp_enabled = true
+# Banner consistent with the emulated Debian 12 shell (see [shell] defaults).
+version = SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2
+
+[telnet]
+enabled = false
+
+[output_jsonlog]
+enabled = true
+logfile = ${honeypot:log_path}/cowrie.json
+epoch_timestamp = false

@@ -1,0 +1,25 @@
+ln -s /tmp/la /tmp/lb; ln -s /tmp/lb /tmp/la; cat /tmp/la; echo rc=$?
+ln -s /tmp/la /tmp/lb; ln -s /tmp/lb /tmp/la; ls -l /tmp/la /tmp/lb; cd /tmp/la; echo rc=$?
+ln -s /tmp/x /tmp/x; ls /tmp/x/; echo /tmp/x/*; find /tmp -maxdepth 2 | wc -l
+mkdir /tmp/d; ln -s /tmp/d /tmp/d/loop; find /tmp/d -follow | head -3; ls -R /tmp/d | head -3; echo /tmp/d/loop/loop/loop/*
+awk 'BEGIN{while(1){}}'; echo rc=$?
+awk 'BEGIN{s="x"; while(1) s=s s}'; echo rc=$?
+awk 'BEGIN{printf "%999999999d", 1}' | wc -c
+awk 'BEGIN{for(i=0;;i++) a[i]=i}'; echo rc=$?
+awk 'BEGIN{print substr("x", 1, 99999999999)}'
+echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa! | awk '/(a+)+b/'; echo rc=$?
+awk "BEGIN{print $(printf '(%.0s' {1..3000})1$(printf ')%.0s' {1..3000})}"; echo rc=$?
+find / -regex '(a+)+b' | head -1; echo rc=$?
+find / $(printf '! %.0s' {1..3000}) -name x; echo rc=$?
+echo /*/*/*/*/*/*/* | wc -c
+echo {1..10000}{1..10000} | wc -c
+echo {a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b} | wc -w
+seq 1 99999999999 | tail -1
+yes | head -3
+cat /proc/self/stat /proc/1/stat /proc/2/status >/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do cat /proc/*/cmdline >/dev/null; done; echo done
+xargs -n1 echo < /dev/zero | head -1; echo rc=$?
+sort /dev/urandom | head -1
+awk '{print}' /dev/urandom | head -1
+sysctl -w kernel.hostname=pwned; hostname; cat /proc/sys/kernel/hostname
+ln -s /etc/shadow /proc/evil; ls -l /proc/evil; echo rc=$?
+cat /proc/self/../../etc/hostname; cat /proc/self/root/etc/hostname; ls /proc/self/root/ | head -3

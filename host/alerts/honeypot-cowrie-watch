@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Follows Cowrie's JSON log; alerts when attackers upload, try to download, or write files.
+At most one alert per type per 10 minutes, so a trivial event never hides an upload;
+suppressed events are counted into the next alert of that type.
+URLs are defanged (hxxp://evil[.]com) so nothing in Discord/ntfy is clickable."""
+import json, re, subprocess, time
+
+LOG = "/opt/honeypot/data/cowrie/var/log/cowrie/cowrie.json"
+WINDOW = 600
+INTERESTING = ("cowrie.session.file_upload", "cowrie.session.file_download",
+               "cowrie.session.file_download.failed")
+
+DL_TOOL = re.compile(r"\b(wget|curl|tftp|ftpget|busybox\s+wget)\b", re.I)
+DL_URL = re.compile(r"(?:https?|ftp|tftp)://[^\s'\";|&]+", re.I)
+
+def defang(s):
+    return re.sub(r"(?i)\bhttp", "hxxp", str(s)).replace(".", "[.]")
+
+last_sent = {}         # alert key -> time of last alert
+suppressed = {}        # alert key -> events folded into the next alert
+last_cmd = {}          # session -> last command typed (explains file writes)
+tail = subprocess.Popen(["tail", "-n0", "-F", LOG], stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True)
+for line in tail.stdout:
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if e.get("eventid") == "cowrie.command.input":
+        cmd = e.get("input") or ""
+        if e.get("session"):
+            last_cmd[e["session"]] = cmd
+            if len(last_cmd) > 5000:
+                last_cmd.clear()
+        # Downloads are blocked by the egress firewall, so DNS fails and Cowrie never
+        # logs a file_download event. Catch the attempt from the typed command instead.
+        urls = DL_URL.findall(cmd) if DL_TOOL.search(cmd) else []
+        if not urls:
+            continue
+        e = {**e, "eventid": "cowrie.session.file_download.failed", "url": " ".join(urls[:3])}
+    elif e.get("eventid") not in INTERESTING:
+        continue
+    if e["eventid"] == "cowrie.session.file_upload":
+        key = "file_upload"
+    elif e["eventid"] == "cowrie.session.file_download" and not e.get("url"):
+        # Cowrie logs every file written with a shell redirect (echo x > f) as a
+        # "download" with no URL: it's the attacker writing a file, not fetching one.
+        key = "file_written"
+    else:
+        key = "file_download"
+    now = time.time()
+    if now - last_sent.get(key, 0.0) < WINDOW:
+        suppressed[key] = suppressed.get(key, 0) + 1
+        continue
+    lines = [f"attacker IP: {e.get('src_ip', '?')}"]
+    if key == "file_written" and last_cmd.get(e.get("session")):
+        lines.append(f"command: {defang(last_cmd[e['session']][:300])}")
+    for k in ("url", "filename", "outfile", "shasum", "size", "session"):
+        if e.get(k):
+            lines.append(f"{k}: {defang(e[k]) if k == 'url' else e[k]}")
+    if suppressed.get(key):
+        lines.append(f"(+{suppressed[key]} more events of this type in the previous 10 min, see Kibana)")
+    subprocess.run(["/usr/local/sbin/honeypot-alert", key, "\n".join(lines)])
+    last_sent[key], suppressed[key] = now, 0

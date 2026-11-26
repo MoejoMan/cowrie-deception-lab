@@ -1,0 +1,14 @@
+# Never commit runtime data, secrets or the private persona
+.env
+data/
+backups/
+cowrie/etc/*
+!cowrie/etc/cowrie.cfg.example
+disguise/
+*.pickle
+*.tgz
+*.tar
+
+# Python bytecode
+__pycache__/
+*.pyc

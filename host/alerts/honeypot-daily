@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Daily heartbeat: last-24h attack stats + health. If this stops arriving, alerting is broken."""
+import base64, json, shutil, subprocess, urllib.request
+
+HP = "/opt/honeypot"
+env = {}
+for line in open(f"{HP}/.env"):
+    if "=" in line and not line.lstrip().startswith("#"):
+        k, v = line.strip().split("=", 1)
+        env[k] = v
+auth = base64.b64encode(f"elastic:{env['ELASTIC_PASSWORD']}".encode()).decode()
+
+query = {
+    "size": 0,
+    "query": {"range": {"@timestamp": {"gte": "now-24h"}}},
+    "aggs": {
+        "sessions": {"cardinality": {"field": "cowrie.session"}},
+        "ips":      {"cardinality": {"field": "cowrie.src_ip"}},
+        "events":   {"terms": {"field": "cowrie.eventid", "size": 30}},
+        "pw":       {"filter": {"terms": {"cowrie.eventid": ["cowrie.login.failed", "cowrie.login.success"]}},
+                     "aggs": {"top": {"terms": {"field": "cowrie.password", "size": 3}}}},
+        "cc":       {"terms": {"field": "source.geo.country_name", "size": 3}},
+        "cmds":     {"terms": {"field": "cowrie.input.keyword", "size": 3}},
+    },
+}
+
+def top(buckets):
+    return ", ".join(f"{b['key']} ({b['doc_count']})" for b in buckets) or "-"
+
+try:
+    req = urllib.request.Request(
+        "http://127.0.0.1:9200/cowrie-*/_search?ignore_unavailable=true&allow_no_indices=true",
+        data=json.dumps(query).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Basic " + auth})
+    a = json.load(urllib.request.urlopen(req, timeout=20)).get("aggregations")
+    if not a:
+        stats = "No events in the last 24h."
+    else:
+        ev = {b["key"]: b["doc_count"] for b in a["events"]["buckets"]}
+        stats = "\n".join([
+            f"Sessions: {a['sessions']['value']}  |  Unique IPs: {a['ips']['value']}",
+            f"Logins: {ev.get('cowrie.login.success', 0)} ok / {ev.get('cowrie.login.failed', 0)} failed  |  "
+            f"Commands: {ev.get('cowrie.command.input', 0)}  |  Uploads: {ev.get('cowrie.session.file_upload', 0)}",
+            f"Top passwords: {top(a['pw']['top']['buckets'])}",
+            f"Top countries: {top(a['cc']['buckets'])}",
+            f"Top commands: {top(a['cmds']['buckets'])}",
+        ])
+except Exception as e:
+    stats = f"Could not query Elasticsearch: {e}"
+
+try:
+    failing = [k for k in open("/var/lib/honeypot-health/failing").read().split() if k]
+except FileNotFoundError:
+    failing = []
+try:
+    pb = json.load(open("/usr/local/share/honeypot/playbook.json"))
+except (OSError, ValueError):
+    pb = {}
+health = ("All health checks passing" if not failing else
+          "FAILING:\n" + "\n".join(f"- {pb.get(k, {}).get('title', k)}" for k in failing))
+du = shutil.disk_usage("/")
+msg = f"{stats}\n\n{health}\nDisk: {du.used * 100 // du.total}% used"
+
+subprocess.run(["/usr/local/sbin/honeypot-alert", "heartbeat", msg])

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Send a honeypot alert to Discord + ntfy, with plain-English playbook guidance.
+
+  honeypot-alert KEY [DETAILS]              one playbook alert (see playbook.json)
+  honeypot-alert --failing KEY,KEY [DETAILS]   health checks that started failing
+  honeypot-alert --recovered KEY,KEY           health checks that are OK again
+  honeypot-alert LEVEL "TITLE" "MESSAGE"     raw alert (LEVEL = critical|warning|info)
+
+HONEYPOT_ALERT_DRYRUN=1 prints instead of sending.
+Secrets: /etc/honeypot-alert.conf (root-only).
+"""
+import json, os, re, socket, subprocess, sys, urllib.request
+
+CONF = "/etc/honeypot-alert.conf"
+PLAYBOOK = "/usr/local/share/honeypot/playbook.json"
+LEVELS = {  # discord colour, ntfy priority, ntfy tag, emoji
+    "critical": (0xE74C3C, "urgent",  "rotating_light",   "🚨"),
+    "warning":  (0xE67E22, "high",    "warning",          "⚠️"),
+    "info":     (0x2ECC71, "default", "white_check_mark", "ℹ️"),
+}
+HOST = socket.gethostname()
+DRY = os.environ.get("HONEYPOT_ALERT_DRYRUN") == "1"
+
+
+def load_conf():
+    conf = {"DISCORD_WEBHOOK": "", "NTFY_SERVER": "https://ntfy.sh", "NTFY_TOPIC": ""}
+    try:
+        for line in open(CONF):
+            m = re.match(r'\s*([A-Z_]+)\s*=\s*"?([^"\n]*)"?', line)
+            if m and not line.lstrip().startswith("#"):
+                conf[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+    return conf
+
+
+def load_playbook():
+    try:
+        return json.load(open(PLAYBOOK))
+    except (OSError, ValueError):
+        return {}
+
+
+def entry(pb, key):
+    return pb.get(key) or {"level": "warning", "title": key, "what": key,
+                           "means": "(no playbook entry for this alert)", "actions": []}
+
+
+def clip(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def numbered(actions):
+    return "\n".join(f"{i}. {a}" for i, a in enumerate(actions, 1))
+
+
+# ---------------------------------------------------------------- build
+def build(args, pb):
+    """Returns (level, title, sections) where sections = [(heading, body), ...] per item."""
+    if args and args[0] in LEVELS:                       # raw
+        level, title, msg = args[0], args[1] if len(args) > 1 else "alert", args[2] if len(args) > 2 else ""
+        return level, title, [[("", msg)]]
+    if args and args[0] in ("--failing", "--recovered"):
+        keys = [k for k in (args[1] if len(args) > 1 else "").split(",") if k]
+        if args[0] == "--recovered":
+            lines = "\n".join(f"✅ FIXED: {entry(pb, k)['title']}" for k in keys)
+            return "info", "Problem resolved: health checks passing again", [[("", lines)]]
+        items = [[("What happened", entry(pb, k)["what"]),
+                  ("What it means", entry(pb, k)["means"]),
+                  ("What to do", numbered(entry(pb, k)["actions"])),
+                  ("__title__", entry(pb, k)["title"])] for k in keys]
+        if len(args) > 2 and args[2]:
+            items[-1].insert(3, ("Details", args[2]))
+        title = entry(pb, keys[0])["title"] if len(keys) == 1 else f"{len(keys)} health checks FAILING"
+        return "warning", title, items
+    key = args[0] if args else "selftest"                # playbook key
+    e = entry(pb, key)
+    sec = [("What happened", e["what"]), ("What it means", e["means"]),
+           ("What to do", numbered(e["actions"]))]
+    if len(args) > 1 and args[1]:
+        sec.append(("Details", args[1]))
+    return e.get("level", "warning"), e["title"], [sec]
+
+
+# ---------------------------------------------------------------- render
+def to_text(level, title, items):
+    out = []
+    for sec in items:
+        sub = dict(sec).get("__title__")
+        if sub and len(items) > 1:
+            out.append(f"▶ {sub.upper()}")
+        for h, body in sec:
+            if h == "__title__":
+                continue
+            out.append(f"{h.upper()}\n{body}" if h else body)
+        out.append("")
+    return clip("\n\n".join(x for x in out if x is not None).strip(), 3900)
+
+
+def to_discord(level, title, items):
+    color, _, _, emoji = LEVELS[level]
+    embeds = []
+    for sec in items[:10]:
+        d = dict(sec)
+        e = {"title": clip(f"{emoji} {d.get('__title__', title)}", 256), "color": color,
+             "footer": {"text": f"{HOST} · {level.upper()}"}, "fields": []}
+        for h, body in sec:
+            if h == "__title__":
+                continue
+            if h in ("What happened", ""):
+                e["description"] = clip(body, 4000) or "-"
+            elif h == "Details":
+                e["fields"].append({"name": h, "value": clip(f"```\n{clip(body, 990)}\n```", 1024)})
+            else:
+                e["fields"].append({"name": h, "value": clip(body, 1024) or "-"})
+        embeds.append(e)
+    return {"username": "honeypot", "content": "@here" if level == "critical" else "",
+            "allowed_mentions": {"parse": ["everyone"]}, "embeds": embeds}
+
+
+# ---------------------------------------------------------------- send
+def post(url, data, headers):
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+def main():
+    level, title, items = build(sys.argv[1:], load_playbook())
+    text = to_text(level, title, items)
+    subprocess.run(["logger", "-t", "honeypot-alert", f"[{level}] {title}"], check=False)
+    if DRY:
+        print(f"===== [{level.upper()}] {title}\n{text}\n")
+        return 0
+    conf, sent = load_conf(), 0
+    _, prio, tag, _ = LEVELS[level]
+    if conf["NTFY_TOPIC"]:
+        try:
+            post(f"{conf['NTFY_SERVER']}/{conf['NTFY_TOPIC']}", text.encode(),
+                 {"Title": f"[{HOST}] {title}".encode("utf-8").decode("latin-1"),
+                  "Priority": prio, "Tags": tag})
+            sent += 1
+        except Exception as ex:
+            subprocess.run(["logger", "-t", "honeypot-alert", f"ntfy send FAILED: {ex}"])
+    if conf["DISCORD_WEBHOOK"]:
+        try:
+            post(conf["DISCORD_WEBHOOK"], json.dumps(to_discord(level, title, items)).encode(),
+                 {"Content-Type": "application/json", "User-Agent": "honeypot-alert/1.0"})
+            sent += 1
+        except Exception as ex:
+            subprocess.run(["logger", "-t", "honeypot-alert", f"Discord send FAILED: {ex}"])
+    if not sent:
+        subprocess.run(["logger", "-t", "honeypot-alert", f"NO channel delivered: {title}"])
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

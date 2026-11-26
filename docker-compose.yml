@@ -1,0 +1,181 @@
+# Cowrie SSH honeypot -> Filebeat -> Elasticsearch -> Kibana
+#
+# Data flow is ONE WAY:  cowrie writes JSON to ./data/cowrie/var/log/cowrie
+#                        filebeat reads that folder read-only and ships it to ES.
+# Cowrie has no network path to the ELK containers, the host, or the internet
+# (enforced by host/04-cowrie-firewall.sh + separate Docker networks).
+#
+# Start with ./up.sh, not `docker compose up` directly (it runs safety checks).
+
+name: honeypot
+
+services:
+
+  # ---------------------------------------------------------------- honeypot
+  cowrie:
+    image: cowrie/cowrie:${COWRIE_VERSION}
+    runtime: runsc                       # gVisor sandbox: its own kernel between Cowrie and ours
+    user: "64999:64999"                  # unused UID on the host, not the image's 999
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m                      # an 83 MB upload peaks at ~330 MB
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev,uid=64999,gid=64999
+    volumes:
+      - ./cowrie/etc:/cowrie/cowrie-git/etc:ro
+      # Disguise: `free` reads the fake /proc/meminfo instead of the container's 256 MB limit
+      - ./cowrie/patches/free.py:/cowrie/cowrie-git/src/cowrie/commands/free.py:ro
+      # Disguise: PersonaAuth (realistic logins: no keyboard-mash, one password per attacker IP)
+      - ./cowrie/patches/auth.py:/cowrie/cowrie-git/src/cowrie/core/auth.py:ro
+      # Fix: exec replies before running the command, so paramiko-based bots work
+      - ./cowrie/patches/protocol.py:/cowrie/cowrie-git/src/cowrie/shell/protocol.py:ro
+      # Disguise: no netstat (Debian 12 default); Cowrie's canned output contradicted the story
+      - ./cowrie/patches/netstat.py:/cowrie/cowrie-git/src/cowrie/commands/netstat.py:ro
+      # Disguise: `which` prints first match only + bash `type` builtin; Debian-style `sudo -l`
+      - ./cowrie/patches/which.py:/cowrie/cowrie-git/src/cowrie/commands/which.py:ro
+      - ./cowrie/patches/sudo.py:/cowrie/cowrie-git/src/cowrie/commands/sudo.py:ro
+      # Disguise: real directory link counts + GNU ls date format
+      - ./cowrie/patches/ls.py:/cowrie/cowrie-git/src/cowrie/commands/ls.py:ro
+      # Disguise: program files read back size-correct and unique (not one 336-byte stub);
+      # relative symlinks resolve from the link's directory, like Linux
+      - ./cowrie/patches/fs.py:/cowrie/cowrie-git/src/cowrie/shell/fs.py:ro
+      # Disguise (round 4/5): procps-style ps, php/perl/git/python3/aws/lsb_release versions,
+      # df, ss, dpkg/apt list, id; round 5: find, ln, readlink, sort, xargs, top, sysctl, cut ... Mounted over yum.py: Debian has no yum, and it loads last.
+      - ./cowrie/patches/extra_cmds.py:/cowrie/cowrie-git/src/cowrie/commands/yum.py:ro
+      # Disguise (round 5): a real awk interpreter (Cowrie's ignored BEGIN/END, patterns, maths, printf)
+      - ./cowrie/patches/hp_awk.py:/cowrie/cowrie-git/src/cowrie/commands/hp_awk.py:ro
+      # Disguise: busybox reports Debian 12's version (stock said 1.20.2 from Debian 7)
+      - ./cowrie/patches/busybox.py:/cowrie/cowrie-git/src/cowrie/commands/busybox.py:ro
+      # whole var/ is bound (the image declares it a VOLUME; binding it avoids a hidden anonymous one)
+      - ./data/cowrie/var:/cowrie/cowrie-git/var
+    ports:
+      # Where the honeypot is reachable, set in .env:
+      #   practice (VPN only): COWRIE_LISTEN=10.99.0.1:2222
+      #   live (internet):     COWRIE_LISTEN=203.0.113.10:22
+      - "${COWRIE_LISTEN}:2222"
+    networks: [cowrie_net]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ---------------------------------------------------------------- ELK
+  es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms768m -Xmx768m"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      xpack.security.enabled: "true"
+      # HTTP is plain inside the box; it is only reachable on 127.0.0.1 and the
+      # private elk network. Kibana is reached over WireGuard, which is encrypted.
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      xpack.ml.enabled: "false"          # saves ~300MB RAM, not needed
+      xpack.license.self_generated.type: basic
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "127.0.0.1:9200:9200"            # localhost only, never public
+    networks: [elk_net]
+    mem_limit: 1500m
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs -u elastic:$$ELASTIC_PASSWORD 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # One-shot: passwords, Filebeat user, retention policy, GeoIP pipeline, index template.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    depends_on:
+      es: { condition: service_healthy }
+    entrypoint: ["bash", "/setup.sh"]
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD}
+      FILEBEAT_PASSWORD: ${FILEBEAT_PASSWORD}
+    volumes:
+      - ./elk/setup.sh:/setup.sh:ro
+    networks: [elk_net]
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION}
+    depends_on:
+      es-setup: { condition: service_completed_successfully }
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://es:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD}
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_KEY_SECURITY}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_KEY_SAVEDOBJECTS}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_KEY_REPORTING}
+      TELEMETRY_OPTIN: "false"
+      NODE_OPTIONS: "--max-old-space-size=1024"
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+    ports:
+      - "${WG_IP}:5601:5601"             # WireGuard only: http://10.99.0.1:5601
+    networks: [elk_net]
+    mem_limit: 1400m
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:${ELASTIC_VERSION}
+    depends_on:
+      es-setup: { condition: service_completed_successfully }
+    command: ["-e", "--strict.perms=false"]
+    environment:
+      FILEBEAT_PASSWORD: ${FILEBEAT_PASSWORD}
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./data/cowrie/var/log/cowrie:/cowrie-logs:ro      # read-only: Filebeat can't alter the evidence
+      - filebeat-data:/usr/share/filebeat/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 200m
+    networks: [elk_net]                  # deliberately NOT on cowrie_net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  cowrie_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-cowrie   # name the egress firewall matches on
+    ipam:
+      config:
+        - subnet: 172.30.66.0/24
+  elk_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-elk
+
+volumes:
+  es-data:
+  kibana-data:
+  filebeat-data:
