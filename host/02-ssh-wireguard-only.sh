@@ -32,7 +32,7 @@ fi
 echo "== pre-flight checks"
 ip -4 addr show wg0 | grep -q "inet $WG_IP/" || { echo "wg0 does not have $WG_IP. Aborting."; exit 1; }
 systemctl is-enabled --quiet wg-quick@wg0 || { echo "wg-quick@wg0 is not enabled at boot. Aborting (you'd be locked out after a reboot)."; exit 1; }
-ss -Htn state established '( sport = :22 )' | grep -q ' 10\.66\.66\.' \
+ss -Htn state established '( sport = :22 )' | grep -q ' 10\.99\.0\.' \
   || { echo "You are not currently connected over WireGuard. Connect via admin@$WG_IP first. Aborting."; exit 1; }
 systemctl is-active --quiet atd || { echo "atd not running (needed for auto-revert). Aborting."; exit 1; }
 echo "   ok: wg0 up, enabled at boot, you're connected over the VPN"

@@ -7,7 +7,7 @@ set -euo pipefail
 VPN_NET=10.99.0.0/24
 
 echo "== fail2ban: add $VPN_NET to ignoreip"
-if grep -qE "^\s*ignoreip.*10\.66\.66\.0/24" /etc/fail2ban/jail.local; then
+if grep -qE "^\s*ignoreip.*10\.99\.0\.0/24" /etc/fail2ban/jail.local; then
   echo "   already present"
 else
   cp -a /etc/fail2ban/jail.local /etc/fail2ban/jail.local.bak.$(date +%F)
